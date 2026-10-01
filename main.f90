@@ -39,8 +39,10 @@
 !
 !
 ! NEXT STEPS ToDo
-!   1. Add Periodic Boundary Conditions
-!   2. Protect code from division by zero in Lennar-Jones force calculation
+!   1. Add Periodic Boundary Conditions. Done!
+!   2. Protect code from division by zero in Lennar-Jones force calculation.
+!      Done!
+!   3. Add functions for extracting and saving energy = kinetic + potential
 
 
 ! =============================================================================
@@ -503,25 +505,29 @@ module simulation
 
         if (i == 1) then
             open(newunit  = io_unit,                               &
-                 file     = self%dataDirectory // "position.txt",  &
+                 file     = self%dataDirectory // "position.xyz",  &
                  status   = "replace",                             &
                  action   = "write",                               &
                  iostat   = status_code)
                 
                 if (status_code /= 0) then
-                    print *, "ERROR: Could not open file: ", self%dataDirectory // "position.txt"
+                    print *, "ERROR: Could not open file: ", & 
+                          self%dataDirectory // "position.xyz"
                     print *, "Does the target directory exist?"
                     stop 1
                 end if
         end if
 
         if (mod(i, self%framePeriod) == 0) then
+
+            write(io_unit, '(I8)') self%numParticles
+
             write(io_unit, '(A, I8, A, F12.6)') &
                   "Lennard-Jones MD Frame | Step = ", i, &
                   " | Time = ", real(i, dp) * self%dt
 
             do j = 1, self%numParticles
-                write(io_unit, '(I12, 3(1X, F12.6))') j, self%position(1, j), &
+                write(io_unit, '(A, 3(1X, F12.6))') "H", self%position(1, j), &
                                                          self%position(2, j), &
                                                          self%position(3, j)
             end do
@@ -593,12 +599,12 @@ program main
     ! =====================
     ! Setting up parameters
     ! =====================
-    numParticles  = 500            ! Total number of particles
-    numSteps      = 10000          ! Total number of time steps
-    framePeriod   = 100            ! Steps between Coordinates storage
-    volume        = 9.0_dp         ! Length of the 1D system
+    numParticles  = 512            ! Total number of particles
+    numSteps      = 5000           ! Total number of time steps
+    framePeriod   = 1              ! Steps between Coordinates storage
+    volume        = 100.0_dp       ! Volume of the 1D system
     mass          = 1.0_dp         ! Particles' mass
-    dt            = 1e-3_dp        ! Size of time step
+    dt            = 1e-5_dp        ! Size of time step
     kb            = 1.0_dp         ! Boltzmann's constant
     temp          = 0.85_dp        ! Temperature of the system
     sigma         = 1.0_dp         ! For Lennard-Jones
