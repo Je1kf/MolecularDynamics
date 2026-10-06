@@ -1,6 +1,17 @@
-! Developing a 3D version of the velocity verlet.
+! =============================================================================
+! For compilation
+!                   > gfortran -O3 -fopenmp your_files.f90 -o simulation
+! For execution
+!                   > export OMP_NUM_THREADS=8
+!                   > /usr/bin/time -v ./simulation
+!
+! -O3 in gfortran call is for asking to the compiler for maximum optimization.
+! =============================================================================
+!
+!
+!Developing a 3D version of the velocity verlet.
 ! Hopefully will be parallelized.
-! ToDo:
+!
 !   1. Update allocateXVF() to 3D.
 !   2. Include Lennard-Jones force field.
 !   3. Update getForces() to 3D.
@@ -29,7 +40,7 @@
 ! Completed Tasks:
 !   1. Done! 2. Done! 3. Done! 4. Done! 5. Done!      
 !   6. Done! 7. Done! 8. Done! 9. Done! 10. Done!
-!   11.      12. Done!  13. Done!   14. Done!
+!   11. On progress 12. Done!  13. Done!   14. Done!
 !
 !
 ! IMPORTANT:
@@ -38,11 +49,26 @@
 !
 !
 !
-! NEXT STEPS ToDo
+! NEXT STEPS: Done!
 !   1. Add Periodic Boundary Conditions. Done!
 !   2. Protect code from division by zero in Lennar-Jones force calculation.
 !      Done!
 !   3. Add functions for extracting and saving energy = kinetic + potential
+! 
+!
+!
+! Further steps ToDo!
+!   -> Extract Statistics:
+!           1. Potential Energy.                            STATE: Done!
+!           2. Kinetic Energy.                              STATE: Done!
+!               2.1. Update getTemperature function.        STATE: Done!
+!           3. Internal Energy.                             STATE: Done! 
+!           4. Preassure.                                   STATE: Done!
+!           5. Correlation Function.                        STATE:
+!           6. Update temp and press in verletStep          STATE: Better, not.
+!
+!   -> Include statistics outputs in the output files.      STATE: Done!
+!   -> Create output file for the correlation function.     STATE: 
 
 
 ! =============================================================================
@@ -66,6 +92,10 @@ module simulation
         real(dp), private :: sigma         ! From Lennard-Jones
         real(dp), private :: epsilon0      ! From Lennard-Jones
         real(dp), private :: rCut          ! Max radius to compute force
+        real(dp), private :: U_rCut        ! Potential energy at rCut
+        real(dp), private :: press         ! System's Preassure
+        real(dp), private :: kEnergy       ! Kinetic energy of the system
+        real(dp), private :: uEnergy       ! Potential energy of the system
 
 
         character(len=:), allocatable, private          :: dataDirectory
@@ -76,7 +106,8 @@ module simulation
         contains
             ! Alias the force field for being able to change it independently
             ! procedure, nopass :: forceField => forceLogHarmonic
-            procedure :: forceField => forceLennardJones
+            procedure :: forceField     => forceLennardJones
+            procedure :: potentialField => potentialLennardJones
 
             ! The main subroutines
             procedure :: initPositions
@@ -85,9 +116,13 @@ module simulation
             procedure :: initUniformVelocities
             procedure :: getForces
             procedure :: verletStep
+            procedure :: getTotalPotentialEnergy
+            procedure :: getTotalKineticEnergy
+            procedure :: getPreassure
 
             procedure :: storePosition
             procedure :: storeVelocity
+            procedure :: storeData
 
             procedure :: allocateXVF
 
@@ -104,6 +139,8 @@ module simulation
             procedure :: setEpsilon
             procedure :: setRCut
             procedure :: setOutputDir
+            procedure :: setKEnergy
+            procedure :: setKEnergy0
 
             ! Get subroutines for privates
             procedure :: getNumParticles
@@ -188,7 +225,12 @@ module simulation
     subroutine setRCut(self, number)
         class(simState), intent(inout) :: self
         real(dp),        intent(in)    :: number
+        real(dp)                       :: sr
+
         self%rCut = number
+        sr = self%sigma / number
+
+        self%U_rCut = 4.0_dp * self%epsilon0 * (sr**12 - sr**6)
     end subroutine setRCut
 
     subroutine setOutputDir(self, dir)
@@ -196,6 +238,18 @@ module simulation
         character(len=*), intent(in)    :: dir
         self%dataDirectory = dir
     end subroutine setOutputDir
+
+    subroutine setKEnergy(self)
+        class(simState), intent(inout) :: self
+
+        self%kEnergy = self%getTotalKineticEnergy()
+    end subroutine setKEnergy
+
+    subroutine setKEnergy0(self)
+        class(simState), intent(inout) :: self
+
+        self%kEnergy = 1.5_dp * self%numParticles * self%kb * self%temp
+    end subroutine setKEnergy0
 
     
     ! Get function
@@ -237,9 +291,9 @@ module simulation
     real(dp) function getTemperature(self)
         class(simState), intent(in) :: self
 
-        ! By equipartition theorem T = (m/(3*Kb*N)) * sum_i(v_i^2)
-        getTemperature = self%mass * sum(self%velocity**2) / &
-                          (3.0_dp * self%kb * self%numParticles)
+        ! By equipartition theorem T = 2*K/(3*Kb*N)
+        getTemperature = 2.0_dp * self%kEnergy / &
+                        (3.0_dp * self%kb * self%numParticles)
     end function getTemperature
 
     real(dp) function getSigma(self)
@@ -270,6 +324,35 @@ module simulation
         allocate(self%velocity(3, self%numParticles))
         allocate(self%force(3, self%numParticles))
     end subroutine allocateXVF
+
+    ! =====================
+    ! Potentials
+    ! =====================
+    pure subroutine potentialLennardJones(self, r1, r2, u)
+        class(simState), intent(in)        :: self
+        real(dp), intent(in), dimension(3) :: r1, r2
+        real(dp), intent(out)              :: u
+        real(dp), dimension(3)             :: dr
+        real(dp)                           :: l_box, r2_val, sigma2, &
+                                              inv_r2, sr2, sr6, sr12
+
+        u = 0.0_dp
+        l_box = self%volume ** (1.0_dp / 3.0_dp)
+        dr = r2 - r1
+        ! anint() is nint() but returns real(dp)
+        dr = dr - l_box * anint(dr / l_box)
+        r2_val = sum(dr**2)
+
+        if (r2_val < self%rCut**2 .and. r2_val > 1e-12_dp) then
+            sigma2 = self%sigma ** 2
+            inv_r2 = 1.0_dp / r2_val
+            sr2 = sigma2 * inv_r2
+            sr6 = sr2 * sr2 * sr2
+            sr12 = sr6 * sr6
+
+            u = 4.0_dp * self%epsilon0 * (sr12 - sr6) - self%U_rCut
+        end if
+    end subroutine
 
     ! =====================
     ! Force Fields
@@ -334,7 +417,8 @@ module simulation
                     cycle
                 end if
 
-                call self%forceField(self%position(:, i), self%position(:, j), f)
+                call self%forceField(self%position(:, i), &
+                                     self%position(:, j), f)
                 self%force(:, i) = self%force(:, i) + f
             end do
         end do
@@ -342,6 +426,107 @@ module simulation
 
 
     end subroutine getForces
+
+
+    ! =====================
+    ! Extracting Statistics
+    ! =====================
+    real(dp) function getTotalPotentialEnergy(self)
+        class(simState), intent(in)                :: self
+        integer                                    :: i, j
+        real(dp)                                   :: u, energy
+
+        u = 0.0_dp
+        energy = 0.0_dp
+
+
+        ! reduction(+:X) do this: 
+        !       1. Creates an independent copy of X for each thread.
+        !       2. Initializes each copy to 0.
+        !       3. (loop operations).
+        !       3. When the loop end adds up each copy of X with the original
+        !          X variable of the main node.
+        !
+        ! schedule(dynamic) evaluates if a thread finished its task and then 
+        ! assigns a new task which haven't been done yet by other threads.
+        ! It is not as efficient in task assignment as schedule(static) 
+        ! because it needs to evaluate the workload of threads periodically.
+        ! But, in this case, with triangular calculation, works perfectly.
+        !$omp parallel do default(none)       &
+        !$omp             shared(self)        &
+        !$omp             private(i, j, u)    &
+        !$omp             reduction(+:energy) &
+        !$omp             schedule(dynamic)
+        do i = 1, self%numParticles
+            do j = i+1, self%numParticles
+
+                call self%potentialField(self%position(:, i), &
+                                    self%position(:, j), u)
+
+                energy = energy + u
+            end do
+        end do
+        !$omp end parallel do
+
+        getTotalPotentialEnergy = energy
+    end function getTotalPotentialEnergy
+
+    real(dp) function getTotalKineticEnergy(self)
+        class(simState), intent(in) :: self
+        integer                     :: i
+        real(dp)                    :: energy
+
+        energy = 0.0_dp
+
+        !$omp parallel do default(none)        &
+        !$omp             shared(self)         &
+        !$omp             private(i)           &
+        !$omp             reduction(+:energy)  &
+        !$omp             schedule(static)
+        do i = 1, self%numParticles
+            energy = energy + sum(self%velocity(:, i)**2)
+        end do
+        !$omp end parallel do
+
+        getTotalKineticEnergy = 0.5_dp * self%mass * energy
+    end function getTotalKineticEnergy
+
+    real(dp) function getPreassure(self)
+        class(simState), intent(in) :: self
+        real(dp), dimension(3)      :: f, r
+        integer                     :: i, j
+        real(dp)                    :: aux, l_box
+
+
+        f = 0.0_dp
+        r = 0.0_dp
+        aux = 0.0_dp
+        l_box = self%volume ** (1.0_dp / 3.0_dp)
+
+       
+        !$omp parallel do default(none)       &
+        !$omp             shared(self, l_box) &
+        !$omp             private(i, j, f, r) &
+        !$omp             reduction(+:aux)    &
+        !$omp             schedule(dynamic)
+        do i = 1, self%numParticles
+            do j = i+1, self%numParticles
+                r = self%position(:, i) - self%position(:, j)
+                r = r - l_box * anint(r / l_box) 
+
+                call self%forceField(self%position(:, i), &
+                                     self%position(:, j), f)
+
+                aux = aux + dot_product(f, r)
+            end do
+        end do
+        !$omp end parallel do
+
+        getPreassure = self%numParticles*self%kb*self%getTemperature() / &
+                       self%volume + aux / (3.0_dp * self%volume)
+    end function getPreassure
+
+
 
 
     ! =====================
@@ -443,7 +628,6 @@ module simulation
             alpha = sqrt(self%temp / temp1)
             self%velocity = self%velocity * alpha
         end if
-
     end subroutine initMaxwellBoltzmannVelocities
 
 
@@ -490,6 +674,9 @@ module simulation
 
         self%velocity = v_aux + self%dt * self%force * 0.5_dp / self%mass
 
+        ! Update press and temp here?
+        !       Ans-> Better not, too expensive to compute at each step.
+
     end subroutine verletStep
 
 
@@ -497,10 +684,10 @@ module simulation
     ! Storing data
     ! =====================
     subroutine storePosition(self, i)
-        class(simState),  intent(in) :: self
-        integer,          intent(in) :: i
-        integer,          save       :: io_unit
-        integer                      :: status_code, j
+        class(simState),  intent(inout) :: self  ! only for modifying kEnergy
+        integer,          intent(in)    :: i
+        integer,          save          :: io_unit
+        integer                         :: status_code, j
 
 
         if (i == 1) then
@@ -520,11 +707,18 @@ module simulation
 
         if (mod(i, self%framePeriod) == 0) then
 
+            ! Calculate and store the total kinetic energy in self%kEnergy
+            call self%setKEnergy()
+
             write(io_unit, '(I8)') self%numParticles
 
-            write(io_unit, '(A, I8, A, F12.6)') &
-                  "Lennard-Jones MD Frame | Step = ", i, &
-                  " | Time = ", real(i, dp) * self%dt
+            write(io_unit, '(A, I8, 5(A, F12.6))') &
+                  "Step = ",            i,                               &
+                  ", Time = ",          real(i, dp) * self%dt,           &
+                  ", Temperature = ",   self%getTemperature(),           &
+                  ", Potential = ",     self%getTotalPotentialEnergy(),  &
+                  ", Kinetic = ",       self%kEnergy,                    &
+                  ", Preassure = ",     self%getPreassure()              
 
             do j = 1, self%numParticles
                 write(io_unit, '(A, 3(1X, F12.6))') "H", self%position(1, j), &
@@ -575,6 +769,113 @@ module simulation
             close(io_unit)
         end if
     end subroutine storeVelocity
+
+    subroutine storeData(self, i)
+        class(simState),  intent(inout) :: self  ! only for modifying kEnergy
+        integer,          intent(in)    :: i
+        integer, dimension(4), save     :: io_unit
+        integer                         :: status_code, j
+        character(len=20), dimension(4) :: files
+        real(dp), dimension(5)          :: stateFunctions
+
+        stateFunctions = 0.0_dp
+
+        files(1) = "position.xyz"
+        files(2) = "velocity.xyz"
+        files(3) = "stateFunctions.txt"
+        files(4) = "Parameters.txt"
+
+
+        if (i == 1) then
+            do j = 1, 4
+                open(newunit  = io_unit(j),                            &
+                     file     = self%dataDirectory // files(j),        &
+                     status   = "replace",                             &
+                     action   = "write",                               &
+                     iostat   = status_code)
+                
+                if (status_code /= 0) then
+                    print *, "ERROR: Could not open file: ", & 
+                              self%dataDirectory // files(j)
+                    print *, "Does the target directory exist?"
+                    stop 1
+                end if
+            end do
+
+
+            write(io_unit(3), '(6(A, 4X))') "step", "time", "T", "U", "K", "P"
+
+            ! Saving Simulation Parameters
+            write(io_unit(4), '(A, I8)') "numParticles", self%numParticles
+            write(io_unit(4), '(A, I8)') "numSteps",     self%numSteps
+            write(io_unit(4), '(A, I8)') "framePeriod",  self%framePeriod
+            write(io_unit(4), '(A, F12.6)') "volume",    self%volume
+            write(io_unit(4), '(A, F12.6)') "mass",      self%mass
+            write(io_unit(4), '(A, F12.6)') "dt",        self%dt
+            write(io_unit(4), '(A, F12.6)') "kb",        self%kb
+            write(io_unit(4), '(A, F12.6)') "temp",      self%temp
+            write(io_unit(4), '(A, F12.6)') "sigma",     self%sigma
+            write(io_unit(4), '(A, F12.6)') "epsilon",   self%epsilon0
+            write(io_unit(4), '(A, F12.6)') "rCut",      self%rCut
+            close(io_unit(4))
+        end if
+
+        if (mod(i, self%framePeriod) == 0) then
+
+            ! Calculate and store the total kinetic energy in self%kEnergy
+            call self%setKEnergy()
+            stateFunctions(1) = real(i, dp) * self%dt
+            stateFunctions(2) = self%getTemperature()
+            stateFunctions(3) = self%getTotalPotentialEnergy()
+            stateFunctions(4) = self%kEnergy
+            stateFunctions(5) = self%getPreassure()
+
+            ! Positions
+            write(io_unit(1), '(I8)') self%numParticles
+            write(io_unit(1), '(A, I8, 5(A, F12.6))') &
+                  "Step = ",           i,                  &
+                  ", Time = ",         stateFunctions(1),  &
+                  ", Temperature = ",  stateFunctions(2),  &
+                  ", Potential = ",    stateFunctions(3),  &
+                  ", Kinetic = ",      stateFunctions(4),  &
+                  ", Preassure = ",    stateFunctions(5)              
+            do j = 1, self%numParticles
+                write(io_unit(1), '(A, 3(1X, F12.6))') "H", &
+                                                       self%position(1, j), &
+                                                       self%position(2, j), &
+                                                       self%position(3, j)
+            end do
+
+            ! Velocities
+            write(io_unit(2), '(I8)') self%numParticles
+            write(io_unit(2), '(A, I8, 5(A, F12.6))') &
+                  "Step = ",           i,                  &
+                  ", Time = ",         stateFunctions(1),  &
+                  ", Temperature = ",  stateFunctions(2),  &
+                  ", Potential = ",    stateFunctions(3),  &
+                  ", Kinetic = ",      stateFunctions(4),  &
+                  ", Preassure = ",    stateFunctions(5)              
+            do j = 1, self%numParticles
+                write(io_unit(2), '(A, 3(1X, F12.6))') "H", &
+                                                       self%velocity(1, j), &
+                                                       self%velocity(2, j), &
+                                                       self%velocity(3, j)
+            end do
+
+            ! State functions
+            write(io_unit(3), '(I8, 5(F16.6))') i, stateFunctions(1),  &
+                                                   stateFunctions(2),  & 
+                                                   stateFunctions(3),  & 
+                                                   stateFunctions(4),  & 
+                                                   stateFunctions(5)
+        end if
+
+        if (i == self%numSteps) then
+            close(io_unit(1))
+            close(io_unit(2))
+            close(io_unit(3))
+        end if
+    end subroutine storeData
 end module
 
 
@@ -599,17 +900,17 @@ program main
     ! =====================
     ! Setting up parameters
     ! =====================
-    numParticles  = 512            ! Total number of particles
-    numSteps      = 5000           ! Total number of time steps
-    framePeriod   = 1              ! Steps between Coordinates storage
-    volume        = 100.0_dp       ! Volume of the 1D system
-    mass          = 1.0_dp         ! Particles' mass
-    dt            = 1e-5_dp        ! Size of time step
-    kb            = 1.0_dp         ! Boltzmann's constant
-    temp          = 0.85_dp        ! Temperature of the system
-    sigma         = 1.0_dp         ! For Lennard-Jones
-    epsilon0      = 1.0_dp         ! For Lennard-Jones
-    rCut          = 2.5_dp         ! For truncating far interactions
+    numParticles  = 512             ! Total number of particles
+    numSteps      = 50000           ! Total number of time steps
+    framePeriod   = 10              ! Steps between Coordinates storage
+    volume        = 1000.0_dp       ! Volume of the 1D system
+    mass          = 1.0_dp          ! Particles' mass
+    dt            = 1e-3_dp         ! Size of time step
+    kb            = 1.0_dp          ! Boltzmann's constant
+    temp          = 4.0_dp          ! Temperature of the system
+    sigma         = 1.0_dp          ! For Lennard-Jones
+    epsilon0      = 1.0_dp          ! For Lennard-Jones
+    rCut          = 2.5_dp * sigma  ! For truncating far interactions
 
 
     call state%setOutputDir(dataDirectory)
@@ -624,6 +925,8 @@ program main
     call state%setSigma(sigma)
     call state%setEpsilon(epsilon0)
     call state%setRCut(rCut)
+
+    call state%setKEnergy0()
 
 
     ! =====================
@@ -641,8 +944,9 @@ program main
     ! Main Loop
     ! =====================
     do i = 1, numSteps
+        ! call state%storeVelocity(i)
+        ! call state%storePosition(i)
+        call state%storeData(i)
         call state%verletStep()
-        call state%storePosition(i)
-        call state%storeVelocity(i)
     end do
 end program main
